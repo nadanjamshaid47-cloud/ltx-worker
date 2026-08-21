@@ -24,10 +24,8 @@ TIER_CONFIG = {
     },
 }
 
-# Match this to the "Execution timeout" value set on the RunPod endpoint.
 SUBPROCESS_TIMEOUT_SECONDS = 600
 SEED_DOWNLOAD_TIMEOUT_SECONDS = 30
-
 
 def handler(event):
     inp = event["input"]
@@ -37,9 +35,9 @@ def handler(event):
     seed_image_url = inp.get("seed_image_url")
 
     if tier not in TIER_CONFIG:
-        return {"error": f"invalid tier '{tier}'", "chunk_idx": chunk_idx}
-    cfg = TIER_CONFIG[tier]
+        return {"error": f"invalid tier '{tier}'", "chunk_idx": chunk_idx, "status": "failed"}
 
+    cfg = TIER_CONFIG[tier]
     output_path = f"/tmp/chunk_{chunk_idx}.mp4"
     seed_path = f"/tmp/seed_{chunk_idx}.png"
 
@@ -67,12 +65,11 @@ def handler(event):
         try:
             resp = requests.get(seed_image_url, timeout=SEED_DOWNLOAD_TIMEOUT_SECONDS)
             resp.raise_for_status()
+            with open(seed_path, "wb") as f:
+                f.write(resp.content)
+            cmd += ["--image", seed_path, "0", "0.9"]
         except requests.RequestException as e:
-            return {"error": f"seed image download failed: {e}", "chunk_idx": chunk_idx}
-
-        with open(seed_path, "wb") as f:
-            f.write(resp.content)
-        cmd += ["--image", seed_path, "0", "0.9"]
+            return {"error": f"seed image download failed: {e}", "chunk_idx": chunk_idx, "status": "failed"}
 
     try:
         result = subprocess.run(
@@ -80,7 +77,7 @@ def handler(event):
         )
     except subprocess.TimeoutExpired:
         _cleanup(output_path, seed_path)
-        return {"error": "generation timed out", "chunk_idx": chunk_idx}
+        return {"error": "generation timed out", "chunk_idx": chunk_idx, "status": "failed"}
 
     if result.returncode != 0:
         _cleanup(output_path, seed_path)
@@ -88,17 +85,17 @@ def handler(event):
             "error": result.stderr[-2000:],
             "stdout": result.stdout[-2000:],
             "chunk_idx": chunk_idx,
+            "status": "failed"
         }
 
     try:
         url = upload_to_storage(output_path, chunk_idx, event["id"])
     except Exception as e:
         _cleanup(output_path, seed_path)
-        return {"error": f"upload failed: {e}", "chunk_idx": chunk_idx}
+        return {"error": f"upload failed: {e}", "chunk_idx": chunk_idx, "status": "failed"}
 
     _cleanup(output_path, seed_path)
-    return {"chunk_idx": chunk_idx, "url": url, "tier": tier}
-
+    return {"chunk_idx": chunk_idx, "url": url, "tier": tier, "status": "completed"}
 
 def upload_to_storage(path, chunk_idx, job_id):
     s3 = boto3.client(
@@ -114,9 +111,7 @@ def upload_to_storage(path, chunk_idx, job_id):
     public_url = os.environ.get("B2_PUBLIC_URL")
     if public_url:
         return f"{public_url}/{key}"
-    # Fallback: construct a direct S3-style URL if no public/CDN URL is configured.
     return f"{os.environ['B2_ENDPOINT_URI']}/{bucket}/{key}"
-
 
 def _cleanup(*paths):
     for p in paths:
@@ -125,6 +120,5 @@ def _cleanup(*paths):
                 os.remove(p)
         except OSError:
             pass
-
 
 runpod.serverless.start({"handler": handler})
