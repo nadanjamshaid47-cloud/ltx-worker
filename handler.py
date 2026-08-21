@@ -24,6 +24,10 @@ TIER_CONFIG = {
     },
 }
 
+# Match this to the "Execution timeout" value set on the RunPod endpoint.
+SUBPROCESS_TIMEOUT_SECONDS = 600
+SEED_DOWNLOAD_TIMEOUT_SECONDS = 30
+
 
 def handler(event):
     inp = event["input"]
@@ -32,8 +36,12 @@ def handler(event):
     tier = inp.get("tier", "standard")
     seed_image_url = inp.get("seed_image_url")
 
+    if tier not in TIER_CONFIG:
+        return {"error": f"invalid tier '{tier}'", "chunk_idx": chunk_idx}
     cfg = TIER_CONFIG[tier]
+
     output_path = f"/tmp/chunk_{chunk_idx}.mp4"
+    seed_path = f"/tmp/seed_{chunk_idx}.png"
 
     cmd = [
         "python3", "-m", "ltx_pipelines.ti2vid_two_stages",
@@ -56,29 +64,67 @@ def handler(event):
         cmd += ["--quantization", cfg["quantization"]]
 
     if seed_image_url:
-        seed_path = "/tmp/seed.png"
+        try:
+            resp = requests.get(seed_image_url, timeout=SEED_DOWNLOAD_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            return {"error": f"seed image download failed: {e}", "chunk_idx": chunk_idx}
+
         with open(seed_path, "wb") as f:
-            f.write(requests.get(seed_image_url).content)
+            f.write(resp.content)
         cmd += ["--image", seed_path, "0", "0.9"]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return {"error": result.stderr[-2000:], "chunk_idx": chunk_idx}
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        _cleanup(output_path, seed_path)
+        return {"error": "generation timed out", "chunk_idx": chunk_idx}
 
-    url = upload_to_storage(output_path, chunk_idx, event["id"])
+    if result.returncode != 0:
+        _cleanup(output_path, seed_path)
+        return {
+            "error": result.stderr[-2000:],
+            "stdout": result.stdout[-2000:],
+            "chunk_idx": chunk_idx,
+        }
+
+    try:
+        url = upload_to_storage(output_path, chunk_idx, event["id"])
+    except Exception as e:
+        _cleanup(output_path, seed_path)
+        return {"error": f"upload failed: {e}", "chunk_idx": chunk_idx}
+
+    _cleanup(output_path, seed_path)
     return {"chunk_idx": chunk_idx, "url": url, "tier": tier}
 
 
 def upload_to_storage(path, chunk_idx, job_id):
     s3 = boto3.client(
         "s3",
-        endpoint_url=os.environ["S3_ENDPOINT"],
-        aws_access_key_id=os.environ["S3_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET"],
+        endpoint_url=os.environ["B2_ENDPOINT_URI"],
+        aws_access_key_id=os.environ["B2_KEY_ID"],
+        aws_secret_access_key=os.environ["B2_APPLICATION_KEY"],
     )
+    bucket = os.environ["B2_BUCKET_NAME"]
     key = f"chunks/{job_id}/chunk_{chunk_idx}.mp4"
-    s3.upload_file(path, os.environ["S3_BUCKET"], key)
-    return f"{os.environ['S3_PUBLIC_URL']}/{key}"
+    s3.upload_file(path, bucket, key)
+
+    public_url = os.environ.get("B2_PUBLIC_URL")
+    if public_url:
+        return f"{public_url}/{key}"
+    # Fallback: construct a direct S3-style URL if no public/CDN URL is configured.
+    return f"{os.environ['B2_ENDPOINT_URI']}/{bucket}/{key}"
+
+
+def _cleanup(*paths):
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
 
 
 runpod.serverless.start({"handler": handler})
