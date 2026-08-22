@@ -4,7 +4,8 @@ import os
 import requests
 import boto3
 
-MODELS = "/workspace/models/ltx-2.5"
+# UPDATED PATH - Models are at /workspace/LTX-2/models/ltx-2.5/
+MODELS = "/workspace/LTX-2/models/ltx-2.5"
 
 TIER_CONFIG = {
     "free": {
